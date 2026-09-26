@@ -6,7 +6,7 @@ function headers(env){return {'APCA-API-KEY-ID':env.alpaca_api_key,'APCA-API-SEC
 async function alpaca(env,path,base){const endpoint=base||cfg(env);const r=await fetch(endpoint+path,{headers:headers(env)});const requestId=r.headers.get('x-request-id');let body;try{body=await r.json()}catch{body={message:await r.text()}}if(!r.ok)throw Object.assign(new Error(body?.message||'Alpaca request failed'),{status:r.status,requestId,detail:body});return {body,requestId}}
 function auth(req,env){if(!env.OWNER_TOKEN)return false;const h=req.headers.get('authorization')||'';return h==='Bearer '+env.OWNER_TOKEN}
 export default {async fetch(req,env){const u=new URL(req.url);try{
- if(u.pathname==='/health')return json({ok:true,service:'crypto-trading-bot',mode:'paper',trading_enabled:false,version:'0.1.0',time:new Date().toISOString()});
+ if(u.pathname==='/health')return json({ok:true,service:'crypto-trading-bot',mode:'paper',trading_enabled:false,version:'0.1.1',time:new Date().toISOString()});
  if(!auth(req,env))return json({ok:false,error:'unauthorized'},401,{'www-authenticate':'Bearer'});
  cfg(env);
  if(req.method!=='GET')return json({ok:false,error:'method_not_allowed'},405);
