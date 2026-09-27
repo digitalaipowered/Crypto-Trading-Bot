@@ -85,6 +85,21 @@ async function recordObservation(env,symbol,quote){
     .bind(symbol,quote.bid,quote.ask,midpoint,spreadBps,m1,now()).run();
   return {symbol,bid:quote.bid,ask:quote.ask,midpoint,spread_bps:spreadBps,momentum_bps:m1,momentum_5m_bps:m5,momentum_15m_bps:m15,volatility_bps:volatilityBps,avg_spread_5m_bps:avgSpreadBps};
 }
+async function rollingMetrics(env,symbol,current){
+  const r=await env.db.prepare(`SELECT midpoint,spread_bps,observed_at FROM observations WHERE symbol=? ORDER BY id DESC LIMIT 16`).bind(symbol).all();
+  const rows=r.results||[], price=n=>rows[n]?num(rows[n].midpoint):null, bps=(a,b)=>a&&b?((a-b)/b)*10000:null;
+  const m1=rows.length>1?bps(current.midpoint,price(1)):null, m5=rows.length>5?bps(current.midpoint,price(5)):null, m15=rows.length>15?bps(current.midpoint,price(15)):null;
+  const returns=[]; for(let i=0;i<Math.min(rows.length-1,15);i++){const a=price(i),b=price(i+1);if(a&&b)returns.push(bps(a,b));}
+  const mean=returns.length?returns.reduce((a,b)=>a+b,0)/returns.length:0;
+  const volatility=returns.length>1?Math.sqrt(returns.reduce((s,x)=>s+(x-mean)**2,0)/(returns.length-1)):null;
+  const spreads=rows.slice(0,5).map(x=>num(x.spread_bps)).filter(Number.isFinite);
+  return {momentum_1m_bps:m1,momentum_5m_bps:m5,momentum_15m_bps:m15,volatility_1m_bps:volatility,avg_spread_5m_bps:spreads.length?spreads.reduce((a,b)=>a+b,0)/spreads.length:null,samples:rows.length};
+}
+async function cooldownActive(env,symbol,minutes){
+  const row=await env.db.prepare(`SELECT closed_at,opened_at FROM trades WHERE symbol=? ORDER BY id DESC LIMIT 1`).bind(symbol).first();
+  if(!row)return false; const t=row.closed_at||row.opened_at; if(!t)return false;
+  return (Date.now()-new Date(t).getTime())/60000 < minutes;
+}
 async function openTrade(env){return await env.db.prepare(`SELECT * FROM trades WHERE status IN ('buy_submitted','open','sell_submitted') ORDER BY id ASC LIMIT 1`).first();}
 async function todayNetPnl(env){
   const row=await env.db.prepare(`SELECT COALESCE(SUM(estimated_net_pnl),0) AS pnl FROM trades WHERE status='closed' AND date(closed_at)=date('now')`).first();
@@ -100,7 +115,7 @@ async function submitSell(env,symbol,qty){
 async function getOrder(env,orderId){return await alpacaRequest(env,"GET",PAPER_API,`/orders/${encodeURIComponent(orderId)}`);}
 async function createTrade(env,symbol,observation,order,notional){
   await env.db.prepare(`INSERT INTO trades (symbol,status,notional,buy_order_id,entry_signal_bps,entry_spread_bps,opened_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)`)
-    .bind(symbol,"buy_submitted",notional,order.id,observation.momentum_bps,observation.spread_bps,now(),now(),now()).run();
+    .bind(symbol,"buy_submitted",notional,order.id,observation.momentum_5m_bps??observation.momentum_bps,observation.spread_bps,now(),now(),now()).run();
 }
 async function reconcileBuy(env,trade){
   const order=await getOrder(env,trade.buy_order_id);
@@ -186,24 +201,19 @@ async function cooldownActive(env,symbol,minutes){
 async function findEntry(env,observations){
   const candidates=[];
   for(const obs of observations){
-    const params=await strategy(env,obs.symbol);
-    if(!params||obs.momentum_5m_bps===null||obs.momentum_15m_bps===null)continue;
-    const spreadLimit=num(params.max_spread_bps);
-    const baseThreshold=num(params.entry_momentum_bps);
-    const threshold5=Math.max(8,baseThreshold*0.35);
-    const threshold15=Math.max(15,baseThreshold*0.55);
-    const cooldown=num(params.cooldown_minutes,10);
-    if(await cooldownActive(env,obs.symbol,cooldown))continue;
-    const spreadGood=obs.spread_bps<=spreadLimit&&obs.avg_spread_5m_bps<=spreadLimit;
-    const trendGood=obs.momentum_5m_bps>=threshold5&&obs.momentum_15m_bps>=threshold15;
-    const volatilityOk=obs.volatility_bps===null||obs.volatility_bps<=Math.max(35,baseThreshold);
-    if(spreadGood&&trendGood&&volatilityOk){
-      const score=(obs.momentum_5m_bps*0.6)+(obs.momentum_15m_bps*0.4)-obs.avg_spread_5m_bps-(obs.volatility_bps||0)*0.25;
-      candidates.push({observation:obs,score});
+    const params=await strategy(env,obs.symbol); if(!params)continue;
+    const metrics=await rollingMetrics(env,obs.symbol,obs);
+    const threshold=num(params.entry_momentum_bps), spreadLimit=num(params.max_spread_bps), cooldown=num(params.cooldown_minutes,10);
+    if(metrics.samples<16||await cooldownActive(env,obs.symbol,cooldown))continue;
+    const trendConfirmed=metrics.momentum_1m_bps>0&&metrics.momentum_5m_bps>=threshold&&metrics.momentum_15m_bps>0;
+    const spreadHealthy=obs.spread_bps<=spreadLimit&&(metrics.avg_spread_5m_bps===null||metrics.avg_spread_5m_bps<=spreadLimit);
+    const volatilityHealthy=metrics.volatility_1m_bps===null||metrics.volatility_1m_bps<=Math.max(25,threshold);
+    if(trendConfirmed&&spreadHealthy&&volatilityHealthy){
+      const score=metrics.momentum_5m_bps+(metrics.momentum_15m_bps*0.25)-obs.spread_bps-(metrics.volatility_1m_bps||0)*0.25;
+      candidates.push({observation:{...obs,...metrics},score});
     }
   }
-  candidates.sort((a,b)=>b.score-a.score);
-  return candidates[0]||null;
+  candidates.sort((a,b)=>b.score-a.score); return candidates[0]||null;
 }
 async function runCycle(env){
   validate(env);
@@ -235,6 +245,11 @@ async function botStatus(env){
   const strategies=await env.db.prepare(`SELECT * FROM strategy_params ORDER BY symbol`).all();
   return {version:VERSION,mode:"paper",enabled:num(s.enabled)===1,kill_switch:num(s.kill_switch)===1,paper_only:num(s.paper_only)===1,order_notional:num(s.order_notional),hard_order_cap:12,daily_loss_limit:num(s.daily_loss_limit),consecutive_losses:num(s.consecutive_losses),consecutive_loss_limit:num(s.consecutive_loss_limit),today_estimated_net_pnl:pnl,open_trade:open||null,total_trades:num(counts?.total,0),closed_trades:num(counts?.closed,0),strategies:strategies.results||[],last_cycle_at:s.last_cycle_at};
 }
+async function analytics(env){
+  const summary=await env.db.prepare(`SELECT COUNT(*) total,SUM(CASE WHEN status='closed' THEN 1 ELSE 0 END) closed,SUM(CASE WHEN estimated_net_pnl>0 THEN 1 ELSE 0 END) wins,SUM(CASE WHEN estimated_net_pnl<0 THEN 1 ELSE 0 END) losses,COALESCE(SUM(gross_pnl),0) gross_pnl,COALESCE(SUM(estimated_fees),0) estimated_costs,COALESCE(SUM(estimated_net_pnl),0) estimated_net_pnl,COALESCE(AVG(CASE WHEN status='closed' THEN (julianday(closed_at)-julianday(opened_at))*1440 END),0) avg_hold_minutes FROM trades`).first();
+  const bySymbol=await env.db.prepare(`SELECT symbol,COUNT(*) total,SUM(CASE WHEN status='closed' THEN 1 ELSE 0 END) closed,SUM(CASE WHEN estimated_net_pnl>0 THEN 1 ELSE 0 END) wins,COALESCE(SUM(estimated_net_pnl),0) estimated_net_pnl FROM trades GROUP BY symbol ORDER BY symbol`).all();
+  return {summary,by_symbol:bySymbol.results||[],cost_note:"estimated_costs is a conservative model, not broker-reported fees"};
+}
 async function recentTrades(env){const r=await env.db.prepare(`SELECT * FROM trades ORDER BY id DESC LIMIT 50`).all();return r.results||[];}
 async function recentEvents(env){const r=await env.db.prepare(`SELECT * FROM bot_events ORDER BY id DESC LIMIT 50`).all();return r.results||[];}
 async function setEnabled(env,enabled){await env.db.prepare(`UPDATE bot_settings SET enabled=?,updated_at=? WHERE id=1`).bind(enabled?1:0,now()).run();}
@@ -245,7 +260,7 @@ export default {
     const url=new URL(request.url);
     try{
       if(url.pathname==="/health")return json({ok:true,service:"crypto-trading-bot",version:VERSION,mode:"paper",execution_engine:"installed",safety_lock:"paper-only",symbols:SYMBOLS,time:now()});
-      if(url.pathname==="/")return json({ok:true,service:"crypto-trading-bot",version:VERSION,mode:"paper",message:"Rolling-signal paper execution engine installed.",public:["GET /","GET /health"],owner_routes:["GET /bot/status","POST /bot/cycle","POST /bot/start","POST /bot/stop","POST /bot/kill","POST /bot/reset-kill","GET /bot/trades","GET /bot/events"]});
+      if(url.pathname==="/")return json({ok:true,service:"crypto-trading-bot",version:VERSION,mode:"paper",message:"Rolling-signal paper execution engine installed.",public:["GET /","GET /health"],owner_routes:["GET /bot/status","POST /bot/cycle","POST /bot/start","POST /bot/stop","POST /bot/kill","POST /bot/reset-kill","GET /bot/trades","GET /bot/events","GET /bot/analytics"]});
       if(!ownerAuthorized(request,env))return json({ok:false,error:"unauthorized"},401);
       validate(env);
       if(url.pathname==="/bot/status"&&request.method==="GET")return json({ok:true,bot:await botStatus(env)});
@@ -261,7 +276,7 @@ export default {
       if(url.pathname==="/bot/kill"&&request.method==="POST"){await setKill(env,true);await logEvent(env,"kill_switch","Kill switch activated.",null,null,"warning");return json({ok:true,kill_switch:true,enabled:false});}
       if(url.pathname==="/bot/reset-kill"&&request.method==="POST"){await setKill(env,false);await logEvent(env,"kill_switch_reset","Kill switch reset.");return json({ok:true,kill_switch:false,enabled:false});}
       if(url.pathname==="/bot/trades"&&request.method==="GET")return json({ok:true,trades:await recentTrades(env)});
-      if(url.pathname==="/bot/events"&&request.method==="GET")return json({ok:true,events:await recentEvents(env)});
+      if(url.pathname==="/bot/events"&&request.method==="GET")return json({ok:true,events:await recentEvents(env)});\n      if(url.pathname==="/bot/analytics"&&request.method==="GET")return json({ok:true,analytics:await analytics(env)});
       return json({ok:false,error:"not_found"},404);
     }catch(error){return json({ok:false,version:VERSION,mode:"paper",error:error?.message||"Internal error"},500);}
   },
