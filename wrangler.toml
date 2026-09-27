@@ -2,5 +2,13 @@ name = "tradingbot"
 main = "src/index.js"
 compatibility_date = "2026-09-26"
 
+[[d1_databases]]
+binding = "db"
+database_name = "tradingbot-db"
+database_id = "654c4bb1-a06e-4067-9081-1632cb8c369d"
+
+[triggers]
+crons = ["* * * * *"]
+
 [observability]
 enabled = true
